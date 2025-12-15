@@ -1,4 +1,4 @@
-# model_text2whucad_lm.py
+# model_text2whucad_lm.py (适配您当前的扁平化 Tokenizer)
 
 import torch
 import torch.nn as nn
@@ -11,64 +11,54 @@ IGNORE_INDEX = -100
 
 class Text2WhuCADLM(nn.Module):
     """
-    文本 -> CAD token 的自回归 LM：
-      - 冻结 BERT，只用作文本编码
-      - 自适应层：BERT hidden -> d_model
-      - CAD 部分：token embedding + position embedding + TransformerEncoder(带 causal mask)
-    训练目标：
-      - 前缀 token -> 预测下一个 token
+    升级版 Text2WhuCADLM：
+    1. 使用 Cross-Attention 机制，让 CAD 生成过程能动态“查询”文本中的细节。
+    2. 兼容您当前的扁平化 Tokenizer (1D Input)。
     """
 
-    def __init__(self, text_encoder, d_model=256, n_layers=2, n_heads=4,
-                 dim_ff=1024, max_len=512):
+    def __init__(self, text_encoder, d_model=256, n_layers=4, n_heads=8,
+                 dim_ff=1024, max_len=512, dropout=0.1):
         super().__init__()
-        self.text_encoder = text_encoder  # transformers.AutoModel
 
+        # -------------------------------------------------------
+        # 1. 文本编码部分 (Encoder)
+        # -------------------------------------------------------
+        self.text_encoder = text_encoder
         # 冻结 BERT 参数
         for p in self.text_encoder.parameters():
             p.requires_grad = False
-        self.text_encoder.eval()
 
-        # 记录文本 hidden 维度
-        hidden_size = self.text_encoder.config.hidden_size
+        text_hidden_size = self.text_encoder.config.hidden_size
+        # 投影层：把 BERT 的 768 维映射到 d_model (256)
+        self.text_proj = nn.Linear(text_hidden_size, d_model)
 
-        # 文本自适应层：BERT hidden -> d_model
-        self.text_adapter = nn.Linear(hidden_size, d_model)
-
-        # CAD token embedding & position embedding
+        # -------------------------------------------------------
+        # 2. CAD 嵌入部分 (Embedding)
+        # -------------------------------------------------------
+        # 依然使用您当前的扁平化 VOCAB_SIZE
         self.token_emb = nn.Embedding(VOCAB_SIZE, d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
+        self.dropout = nn.Dropout(dropout)
 
-        # 自回归 Transformer（encoder + causal mask 实现自回归）
-        encoder_layer = nn.TransformerEncoderLayer(
+        # -------------------------------------------------------
+        # 3. 核心解码器 (Decoder with Cross-Attention)
+        # -------------------------------------------------------
+        # 使用 TransformerDecoderLayer，它自带 Self-Attention 和 Cross-Attention
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_ff,
+            dropout=dropout,
             batch_first=True,
+            activation="gelu"
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
 
-        # 输出层：d_model -> VOCAB_SIZE
+        # -------------------------------------------------------
+        # 4. 输出头
+        # -------------------------------------------------------
         self.out_proj = nn.Linear(d_model, VOCAB_SIZE)
-
         self.max_len = max_len
-
-    def encode_text(self, text_input_ids, text_attention_mask):
-        """
-        冻结 BERT：只做前向，不反传梯度。
-        输出一个条件向量 text_cond: [B, d_model]
-        """
-        with torch.no_grad():
-            outputs = self.text_encoder(
-                input_ids=text_input_ids,
-                attention_mask=text_attention_mask,
-            )
-            # [CLS] 向量
-            cls = outputs.last_hidden_state[:, 0, :]  # [B, hidden_size]
-
-        # 过自适应层 -> [B, d_model]
-        text_cond = self.text_adapter(cls)
-        return text_cond
 
     def forward(self,
                 text_input_ids,
@@ -76,44 +66,74 @@ class Text2WhuCADLM(nn.Module):
                 cad_input_ids,
                 cad_labels=None):
         """
-        text_input_ids:    [B, T_text]
-        text_attention_mask:[B, T_text]
-        cad_input_ids:     [B, L]   (prefix LM 的输入序列)
-        cad_labels:        [B, L]   (下一 token 标签，PAD 用 IGNORE_INDEX)
+        输入维度保持不变，兼容您现有的 train_text2whucad_lm.py
+        text_input_ids:      [B, T_text]
+        text_attention_mask: [B, T_text]
+        cad_input_ids:       [B, L_cad]
         """
-        B, L = cad_input_ids.shape
         device = cad_input_ids.device
+        B, L = cad_input_ids.shape
 
-        # 1) 文本编码 + 自适应层
-        text_cond = self.encode_text(text_input_ids, text_attention_mask)  # [B, d_model]
+        # ==========================================
+        # Step 1: 处理文本 (作为 Memory)
+        # ==========================================
+        with torch.no_grad():
+            # 获取 BERT 最后一层所有 token 的输出: [B, T_text, 768]
+            # 注意：这里不再只取 [CLS]，而是取整个序列！
+            text_out = self.text_encoder(
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask
+            )
+            memory = text_out.last_hidden_state
 
-        # 2) CAD token + 位置编码
-        pos_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, L)  # [B, L]
-        x = self.token_emb(cad_input_ids) + self.pos_emb(pos_ids)           # [B, L, d_model]
+        # 投影到 d_model: [B, T_text, 256]
+        memory = self.text_proj(memory)
 
-        # 3) 文本条件注入：简单相加（FiLM 的最简形式）
-        x = x + text_cond.unsqueeze(1)  # [B, L, d_model]
+        # 生成 memory_mask (告诉 Decoder 文本里哪些是 PAD，不要看)
+        # BERT mask: 1=Valid, 0=Pad
+        # TransformerDecoder mask: True=Ignored(Pad), False=Attend
+        memory_key_padding_mask = (text_attention_mask == 0)
 
-        # 4) 自回归 mask：位置 i 只能看 0..i
-        causal_mask = torch.triu(
+        # ==========================================
+        # Step 2: 处理 CAD 输入 (作为 Target)
+        # ==========================================
+        # 位置编码
+        pos_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+        tgt = self.token_emb(cad_input_ids) + self.pos_emb(pos_ids)
+        tgt = self.dropout(tgt)
+
+        # ==========================================
+        # Step 3: 解码 (Cross-Attention 发生在这里)
+        # ==========================================
+        # 生成自回归掩码 (Causal Mask): 只能看左边
+        tgt_mask = torch.triu(
             torch.ones(L, L, device=device, dtype=torch.bool),
             diagonal=1
-        )  # [L, L] 上三角 True = 禁止注意
+        )
 
-        # TransformerEncoder 支持 attn_mask，True 表示不可见
-        x = self.transformer(x, mask=causal_mask)  # [B, L, d_model]
+        # 输入 Decoder
+        # tgt    = CAD 序列 (Query)
+        # memory = 文本序列 (Key/Value) -> 模型会自动做 Cross-Attention
+        out = self.decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            memory_key_padding_mask=memory_key_padding_mask
+        )
 
-        logits = self.out_proj(x)  # [B, L, VOCAB_SIZE]
+        # ==========================================
+        # Step 4: 预测与 Loss
+        # ==========================================
+        logits = self.out_proj(out)  # [B, L, VOCAB]
 
-        out = {"logits": logits}
+        output = {"logits": logits}
 
         if cad_labels is not None:
-            # 交叉熵，忽略 IGNORE_INDEX
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+                logits.view(-1, VOCAB_SIZE),
                 cad_labels.view(-1),
-                ignore_index=IGNORE_INDEX,
+                ignore_index=IGNORE_INDEX
             )
-            out["loss"] = loss
+            output["loss"] = loss
 
-        return out
+        return output
